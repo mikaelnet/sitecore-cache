@@ -265,7 +265,7 @@
                 }
             }
 
-            string pageVersion = "1.1.0 (localhost-only, read-only SQL diagnostics + guarded EQSTAMP cleanup)";
+            string pageVersion = "1.2.0 (localhost-only, read-only SQL diagnostics + guarded EQSTAMP cleanup)";
             Header.InnerHtml = string.Format("<h2>{0}</h2><h6>Version:&nbsp;{1}</h6>",
                 "Sitecore EventQueue Monitor", pageVersion);
 
@@ -306,9 +306,24 @@
                 return;
             }
 
+            long? myStamp = GetMyStamp(eqStamps);
+
             Controls.InnerHtml = RenderControls(top, selected.Name);
             EqStampPanel.InnerHtml = RenderEqStampTable(eqStamps, events, selected.Name);
-            EventsPanel.InnerHtml = RenderEventsTable(events);
+            EventsPanel.InnerHtml = RenderEventsTable(events, myStamp);
+        }
+
+        // Finds this machine's own parsed EQSTAMP value (if any), used to draw the pointer into
+        // the Events table. If more than one row somehow matches as "current machine", the first
+        // one found wins - ambiguity here would itself be a sign worth noticing in the EQSTAMP
+        // table, not something to silently resolve.
+        private long? GetMyStamp(List<EqStampRow> eqStamps)
+        {
+            foreach (EqStampRow r in eqStamps)
+            {
+                if (r.IsCurrentMachine && r.StampValue.HasValue) return r.StampValue;
+            }
+            return null;
         }
 
         // ===================== Database discovery / connection =====================
@@ -649,11 +664,13 @@
 
                     long headStamp = events.Count > 0 ? events[0].Stamp : 0;
                     long oldestVisible = events.Count > 0 ? events[events.Count - 1].Stamp : 0;
+                    long? myStamp = GetMyStamp(eqStamps);
 
                     sb.Append("\"db\":\"").Append(JsonEscape(dbName)).Append("\"");
                     sb.Append(",\"dataSource\":\"").Append(JsonEscape(dataSource)).Append("\"");
                     sb.Append(",\"catalog\":\"").Append(JsonEscape(catalog)).Append("\"");
                     sb.Append(",\"headStamp\":").Append(headStamp);
+                    sb.Append(",\"myStamp\":").Append(myStamp.HasValue ? myStamp.Value.ToString() : "null");
                     if (queryError != null)
                     {
                         sb.Append(",\"error\":\"").Append(JsonEscape(queryError)).Append("\"");
@@ -860,25 +877,29 @@
             return sb.ToString();
         }
 
-        private string RenderEventsTable(List<EventRow> events)
+        private string RenderEventsTable(List<EventRow> events, long? myStamp)
         {
             StringBuilder sb = new StringBuilder();
             sb.Append("<div class='events-head'>EventQueue (top " + events.Count + " by Stamp, newest first) &mdash; " +
-                "metadata only; the InstanceData payload is not decoded.</div>");
+                "metadata only; the InstanceData payload is not decoded. ");
+            sb.Append("<b>&#9654;</b> marks the event this machine's own EQSTAMP currently points to, when it's within this visible window.</div>");
             sb.Append("<table id='events-table'><thead><tr><th>Stamp</th><th>Created</th><th>EventType</th><th>InstanceType</th><th>Payload</th></tr></thead>");
             sb.Append("<tbody id='events-tbody'>");
-            sb.Append(RenderEventRows(events));
+            sb.Append(RenderEventRows(events, myStamp));
             sb.Append("</tbody></table>");
             return sb.ToString();
         }
 
-        private string RenderEventRows(List<EventRow> events)
+        private string RenderEventRows(List<EventRow> events, long? myStamp)
         {
             StringBuilder sb = new StringBuilder();
             foreach (EventRow ev in events)
             {
-                sb.Append("<tr data-stamp='" + ev.Stamp + "'>");
-                sb.Append("<td class='AlignRight'>" + ev.Stamp + "</td>");
+                bool isMine = myStamp.HasValue && ev.Stamp == myStamp.Value;
+
+                sb.Append("<tr class='" + (isMine ? "eq-mine" : "") + "' data-stamp='" + ev.Stamp + "'>");
+                sb.Append("<td class='AlignRight'>" + (isMine ? "<b>&#9654; " : "") +
+                    ev.Stamp.ToString("#,0") + (isMine ? "</b>" : "") + "</td>");
                 sb.Append("<td>" + ev.Created.ToString("HH:mm:ss") + "</td>");
                 sb.Append("<td class='" + EventTypeCssClass(ev.EventType) + "'>" + HttpUtility.HtmlEncode(ShortTypeName(ev.EventType)) + "</td>");
                 sb.Append("<td class='instance-type'>" + HttpUtility.HtmlEncode(ShortTypeName(ev.InstanceType)) + "</td>");
@@ -1021,7 +1042,7 @@
                 return max;
             }
 
-            function renderEvents(events) {
+            function renderEvents(events, myStamp) {
                 var tbody = q("events-tbody");
                 if (!tbody) { return; }
                 tbody.innerHTML = "";
@@ -1033,10 +1054,23 @@
                     var ev = events[i];
                     var isNew = ev.stamp > highestStampSeen;
                     if (ev.stamp > newHighest) { newHighest = ev.stamp; }
+                    var isMine = (myStamp !== null && myStamp !== undefined && ev.stamp === myStamp);
 
                     var tr = document.createElement("tr");
                     tr.setAttribute("data-stamp", ev.stamp);
-                    tr.appendChild(td(ev.stamp, "AlignRight"));
+                    if (isMine) { tr.classList.add("eq-mine"); }
+
+                    var stampTd = document.createElement("td");
+                    stampTd.className = "AlignRight";
+                    if (isMine) {
+                        var b = document.createElement("b");
+                        b.textContent = GLYPH_PTR + " " + formatNumber(ev.stamp);
+                        stampTd.appendChild(b);
+                    } else {
+                        stampTd.textContent = formatNumber(ev.stamp);
+                    }
+                    tr.appendChild(stampTd);
+
                     tr.appendChild(td(ev.ts, ""));
                     tr.appendChild(td(shortType(ev.ty), eventTypeClass(ev.ty)));
                     tr.appendChild(td(shortType(ev.it), "instance-type"));
@@ -1136,7 +1170,7 @@
                         if (data.error) {
                             setStatus("Error: " + data.error);
                         } else {
-                            renderEvents(data.events || []);
+                            renderEvents(data.events || [], data.myStamp);
                             renderEqStamps(data.eqstamps || [], data.headStamp, (data.events || []).length > 0);
                             setStatus("polls: " + pollCount + ", head stamp: " + formatNumber(data.headStamp) + ", db: " + data.db);
                         }
