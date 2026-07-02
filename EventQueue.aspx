@@ -317,7 +317,7 @@
                 }
             }
 
-            string pageVersion = "1.6.0 (localhost-only, read-only SQL diagnostics + guarded EQSTAMP cleanup)";
+            string pageVersion = "1.6.1 (localhost-only, read-only SQL diagnostics + guarded EQSTAMP cleanup)";
             Header.InnerHtml = string.Format("<h2>{0}</h2><h6>Version:&nbsp;{1}</h6>",
                 "Sitecore EventQueue Monitor", pageVersion);
 
@@ -823,7 +823,6 @@
                     }
 
                     long headStamp = events.Count > 0 ? events[0].Stamp : 0;
-                    long oldestVisible = events.Count > 0 ? events[events.Count - 1].Stamp : 0;
                     long? myStamp = GetMyStamp(eqStamps);
 
                     sb.Append("\"db\":\"").Append(JsonEscape(dbName)).Append("\"");
@@ -873,22 +872,22 @@
                         if (i > 0) sb.Append(',');
                         EqStampRow row = eqStamps[i];
 
-                        // "Unprocessed events": an estimate from the already-loaded top-N window
-                        // (no extra query) — see the matching comment in RenderEqStampRows.
+                        // "Unprocessed events": a plain count from the already-loaded top-N window
+                        // (no extra query) — see the matching comment in RenderEqStampRows. Not
+                        // labeled as a lower bound even when the row falls outside the window; the
+                        // window is usually wide enough in practice and the caveat wasn't wanted.
                         long newer = 0;
                         if (row.StampValue.HasValue)
                         {
                             foreach (EventRow ev in events)
                                 if (ev.Stamp > row.StampValue.Value) newer++;
                         }
-                        bool offscreen = row.StampValue.HasValue && events.Count > 0 && row.StampValue.Value < oldestVisible;
 
                         sb.Append("{\"key\":\"").Append(JsonEscape(row.Key)).Append("\"");
                         sb.Append(",\"val\":\"").Append(JsonEscape(row.RawValue)).Append("\"");
                         sb.Append(",\"stamp\":").Append(row.StampValue.HasValue ? row.StampValue.Value.ToString() : "null");
                         sb.Append(",\"mine\":").Append(row.IsCurrentMachine ? "true" : "false");
                         sb.Append(",\"newer\":").Append(newer);
-                        sb.Append(",\"offscreen\":").Append(offscreen ? "true" : "false");
                         sb.Append("}");
                     }
                     sb.Append("]");
@@ -1094,7 +1093,6 @@
         private string RenderEqStampRows(List<EqStampRow> rows, List<EventRow> events, long? oldestStampAtLoad)
         {
             StringBuilder sb = new StringBuilder();
-            long oldestVisible = events.Count > 0 ? events[events.Count - 1].Stamp : 0;
 
             foreach (EqStampRow row in rows)
             {
@@ -1115,19 +1113,16 @@
                     sb.Append("<td>&quot;" + HttpUtility.HtmlEncode(row.RawValue) + "&quot;</td>");
                 }
 
-                // Unprocessed events: an estimate from the already-loaded top-N window (no extra
-                // query) — exact only up to that window's size, honestly flagged with ">=" once
-                // a row falls outside it. Widen "Show top" for more precision if you need it.
+                // Unprocessed events: a plain count from the already-loaded top-N window (no extra
+                // query) — bounded by whatever "Show top" is set to; widen it if a row needs more
+                // precision than the current window gives.
                 long newer = 0;
                 if (row.StampValue.HasValue)
                 {
                     foreach (EventRow ev in events)
                         if (ev.Stamp > row.StampValue.Value) newer++;
                 }
-                bool offscreen = row.StampValue.HasValue && events.Count > 0 && row.StampValue.Value < oldestVisible;
-                sb.Append("<td class='AlignRight'>" + (row.StampValue.HasValue
-                    ? (offscreen ? "&gt;=" + newer.ToString("#,0") + " (older than visible window)" : newer.ToString("#,0"))
-                    : "n/a") + "</td>");
+                sb.Append("<td class='AlignRight'>" + (row.StampValue.HasValue ? newer.ToString("#,0") : "n/a") + "</td>");
 
                 sb.Append("<td>");
                 if (CanOfferDelete(row, oldestStampAtLoad))
@@ -1592,17 +1587,9 @@
                         tr.appendChild(td(formatNumber(r.stamp), "AlignRight"));
                     }
 
-                    // Unprocessed events: an estimate from the already-loaded top-N window (no
-                    // extra query) — exact only up to that window's size, honestly flagged with
-                    // ">=" once a row falls outside it. Widen "Show top" for more precision.
-                    var unprocessedText;
-                    if (r.stamp === null) {
-                        unprocessedText = "n/a";
-                    } else if (r.offscreen) {
-                        unprocessedText = ">=" + formatNumber(r.newer) + " (older than visible window)";
-                    } else {
-                        unprocessedText = formatNumber(r.newer);
-                    }
+                    // Unprocessed events: a plain count from the already-loaded top-N window (no
+                    // extra query) — bounded by whatever "Show top" is set to.
+                    var unprocessedText = (r.stamp === null) ? "n/a" : formatNumber(r.newer);
                     tr.appendChild(td(unprocessedText, "AlignRight"));
 
                     var actionTd = document.createElement("td");
