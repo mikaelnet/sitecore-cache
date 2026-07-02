@@ -376,6 +376,87 @@
             return top;
         }
 
+        // ===================== Flexible column readers =====================
+        // Learned live: EventQueue's "Stamp" column is SQL Server's rowversion/timestamp type
+        // (an 8-byte auto-incrementing binary counter Sitecore uses to get a free, guaranteed-
+        // monotonic ordering column from SQL Server itself) — not a plain bigint. ADO.NET hands
+        // that back as byte[], and Convert.ToInt64/ToString on a byte[] throws "Unable to cast
+        // object of type 'System.Byte[]' to type 'System.IConvertible'". These helpers read any
+        // column defensively regardless of whether it comes back as a number, string, or bytes,
+        // so a schema surprise degrades gracefully instead of crashing the whole query.
+
+        private long ReadStampValue(object value)
+        {
+            if (value == null || value == DBNull.Value) return 0;
+            byte[] bytes = value as byte[];
+            if (bytes != null) return RowVersionToInt64(bytes);
+            return Convert.ToInt64(value);
+        }
+
+        // rowversion/timestamp bytes arrive in big-endian order; BitConverter needs little-endian
+        // on x86/x64, so reverse before converting. Values still compare/order correctly even
+        // though they're not small sequential numbers (rowversion is a per-database counter).
+        private long RowVersionToInt64(byte[] bytes)
+        {
+            if (bytes == null || bytes.Length == 0) return 0;
+
+            byte[] copy = (byte[])bytes.Clone();
+            if (BitConverter.IsLittleEndian) Array.Reverse(copy);
+
+            if (copy.Length < 8)
+            {
+                byte[] padded = new byte[8];
+                Array.Copy(copy, 0, padded, 8 - copy.Length, copy.Length);
+                copy = padded;
+            }
+            else if (copy.Length > 8)
+            {
+                byte[] truncated = new byte[8];
+                Array.Copy(copy, copy.Length - 8, truncated, 0, 8);
+                copy = truncated;
+            }
+
+            return BitConverter.ToInt64(copy, 0);
+        }
+
+        private string ReadStringValue(object value)
+        {
+            if (value == null || value == DBNull.Value) return string.Empty;
+            byte[] bytes = value as byte[];
+            if (bytes != null)
+            {
+                // Unexpected binary where text was expected — show a hex preview rather than crash.
+                return "0x" + BitConverter.ToString(bytes).Replace("-", "");
+            }
+            return Convert.ToString(value);
+        }
+
+        // Parses a Properties.Value string as a stamp. Accepts a plain decimal number or a SQL
+        // Server-style "0x..." hex literal (how rowversion values are often displayed as text),
+        // so it lines up with whatever format the EQSTAMP value was actually written in.
+        private long? ParseStampValue(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return null;
+            string s = raw.Trim();
+
+            long plain;
+            if (long.TryParse(s, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out plain))
+            {
+                return plain;
+            }
+
+            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            {
+                ulong u;
+                if (ulong.TryParse(s.Substring(2), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out u))
+                {
+                    return unchecked((long)u);
+                }
+            }
+
+            return null;
+        }
+
         // ===================== Queries =====================
 
         private List<EventRow> QueryEvents(DbCandidate db, int top)
@@ -396,10 +477,10 @@
                         {
                             list.Add(new EventRow
                             {
-                                EventType = Convert.ToString(reader["EventType"]),
-                                InstanceType = Convert.ToString(reader["InstanceType"]),
+                                EventType = ReadStringValue(reader["EventType"]),
+                                InstanceType = ReadStringValue(reader["InstanceType"]),
                                 Created = reader["Created"] is DateTime ? (DateTime)reader["Created"] : DateTime.MinValue,
-                                Stamp = Convert.ToInt64(reader["Stamp"]),
+                                Stamp = ReadStampValue(reader["Stamp"]),
                                 PayloadBytes = reader["PayloadBytes"] == DBNull.Value ? 0 : Convert.ToInt64(reader["PayloadBytes"])
                             });
                         }
@@ -430,14 +511,13 @@
                     {
                         while (reader.Read())
                         {
-                            string key = Convert.ToString(reader["Key"]);
-                            string val = reader["Value"] == DBNull.Value ? string.Empty : Convert.ToString(reader["Value"]);
-                            long parsed;
+                            string key = ReadStringValue(reader["Key"]);
+                            string val = ReadStringValue(reader["Value"]);
                             list.Add(new EqStampRow
                             {
                                 Key = key,
                                 RawValue = val,
-                                StampValue = long.TryParse((val ?? string.Empty).Trim(), out parsed) ? (long?)parsed : null,
+                                StampValue = ParseStampValue(val),
                                 IsCurrentMachine = !string.IsNullOrEmpty(instanceName) &&
                                     key.IndexOf(instanceName, StringComparison.OrdinalIgnoreCase) >= 0
                             });
