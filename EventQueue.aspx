@@ -6,6 +6,7 @@
 <%@ Import Namespace="System.Web" %>
 <%@ Import Namespace="System.Data" %>
 <%@ Import Namespace="System.Data.SqlClient" %>
+<%@ Import Namespace="System.Text.RegularExpressions" %>
 
 <script runat="server">
     // =====================================================================
@@ -164,8 +165,18 @@
         .ev-other   { color: #555; }
 
         td.details-cell {
-            color: #777;
-            font-size: 12px;
+            color: #555;
+            font-size: 11px;
+            font-family: Consolas, 'Courier New', monospace;
+            max-width: 340px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        button.copy-btn {
+            font-size: 11px;
+            padding: 2px 8px;
         }
 
         tr.flash-new td {
@@ -190,6 +201,12 @@
             public DateTime Created;
             public long Stamp;
             public long PayloadBytes;
+            // Decoded (UTF-8) text of the FIRST EventPreviewBytes bytes of InstanceData only -
+            // InstanceData turned out to be JSON text, not a binary payload. Bounded deliberately:
+            // fetching this for every row on every poll is fine at a few hundred bytes each, but
+            // fetching the FULL payload for every row would not be - Copy fetches the complete
+            // value on demand instead (see WritePayloadJson).
+            public string PreviewJson;
         }
 
         public class EqStampRow
@@ -234,6 +251,16 @@
             return oldestStamp.HasValue && row.StampValue.Value < oldestStamp.Value;
         }
 
+        // Converts a stamp (as read back from a rowversion column via RowVersionToInt64) into the
+        // big-endian byte[] SQL Server expects when comparing a value against a rowversion column -
+        // needed by the Copy feature's on-demand full-payload lookup (WHERE Stamp = @stamp).
+        private byte[] Int64ToRowVersionBytes(long value)
+        {
+            byte[] bytes = BitConverter.GetBytes(value);
+            if (BitConverter.IsLittleEndian) Array.Reverse(bytes);
+            return bytes;
+        }
+
         protected void Page_Load(object sender, EventArgs e)
         {
             Response.ContentEncoding = System.Text.Encoding.UTF8;
@@ -244,6 +271,14 @@
             if (Request.QueryString["ajax"] == "snapshot")
             {
                 WriteSnapshotJson();
+                return;
+            }
+
+            // ---- On-demand full payload for the Copy button: only fetched when a user actually
+            //      clicks Copy for one specific row, never during regular polling. ----
+            if (Request.QueryString["ajax"] == "payload")
+            {
+                WritePayloadJson();
                 return;
             }
 
@@ -282,7 +317,7 @@
                 }
             }
 
-            string pageVersion = "1.5.0 (localhost-only, read-only SQL diagnostics + guarded EQSTAMP cleanup)";
+            string pageVersion = "1.6.0 (localhost-only, read-only SQL diagnostics + guarded EQSTAMP cleanup)";
             Header.InnerHtml = string.Format("<h2>{0}</h2><h6>Version:&nbsp;{1}</h6>",
                 "Sitecore EventQueue Monitor", pageVersion);
 
@@ -501,6 +536,18 @@
             return Convert.ToString(value);
         }
 
+        // Unlike ReadStringValue (a defensive fallback for columns expected to already be text),
+        // this is specifically for InstanceData: it IS a binary column, but the bytes are UTF-8
+        // encoded JSON text, not an opaque blob — so byte[] decodes to readable text here, on
+        // purpose, rather than falling back to a hex dump.
+        private string ReadJsonTextValue(object value)
+        {
+            if (value == null || value == DBNull.Value) return string.Empty;
+            byte[] bytes = value as byte[];
+            if (bytes != null) return System.Text.Encoding.UTF8.GetString(bytes);
+            return Convert.ToString(value);
+        }
+
         // Parses a Properties.Value string as a stamp. Accepts a plain decimal number or a SQL
         // Server-style "0x..." hex literal (how rowversion values are often displayed as text),
         // so it lines up with whatever format the EQSTAMP value was actually written in.
@@ -529,6 +576,13 @@
 
         // ===================== Queries =====================
 
+        // How much of InstanceData to pull back for every row on every poll. Bounded on purpose -
+        // this is a JSON text payload, and while the small "item saved"-style events are only
+        // ~1KB total (so this usually captures the whole thing anyway), some event types carry
+        // much larger payloads; fetching those in full for every row, every second, isn't worth
+        // it just for a preview. Copy always fetches the true full value separately, on demand.
+        private const int EventPreviewBytes = 600;
+
         private List<EventRow> QueryEvents(DbCandidate db, int top)
         {
             List<EventRow> list = new List<EventRow>();
@@ -536,11 +590,14 @@
             {
                 conn.Open();
                 string sql = "SELECT TOP (@top) EventType, Created, Stamp, " +
-                             "DATALENGTH(InstanceData) AS PayloadBytes FROM [EventQueue] ORDER BY Stamp DESC";
+                             "DATALENGTH(InstanceData) AS PayloadBytes, " +
+                             "SUBSTRING(InstanceData, 1, @previewLen) AS PreviewRaw " +
+                             "FROM [EventQueue] ORDER BY Stamp DESC";
                 using (SqlCommand cmd = new SqlCommand(sql, conn))
                 {
                     cmd.CommandTimeout = 15;
                     cmd.Parameters.Add("@top", SqlDbType.Int).Value = top;
+                    cmd.Parameters.Add("@previewLen", SqlDbType.Int).Value = EventPreviewBytes;
                     using (SqlDataReader reader = cmd.ExecuteReader())
                     {
                         while (reader.Read())
@@ -550,7 +607,8 @@
                                 EventType = ReadStringValue(reader["EventType"]),
                                 Created = reader["Created"] is DateTime ? (DateTime)reader["Created"] : DateTime.MinValue,
                                 Stamp = ReadStampValue(reader["Stamp"]),
-                                PayloadBytes = reader["PayloadBytes"] == DBNull.Value ? 0 : Convert.ToInt64(reader["PayloadBytes"])
+                                PayloadBytes = reader["PayloadBytes"] == DBNull.Value ? 0 : Convert.ToInt64(reader["PayloadBytes"]),
+                                PreviewJson = ReadJsonTextValue(reader["PreviewRaw"])
                             });
                         }
                     }
@@ -804,6 +862,7 @@
                         sb.Append(",\"ts\":\"").Append(ev.Created.ToString("HH:mm:ss")).Append("\"");
                         sb.Append(",\"ty\":\"").Append(JsonEscape(ev.EventType)).Append("\"");
                         sb.Append(",\"pb\":").Append(ev.PayloadBytes);
+                        sb.Append(",\"dt\":\"").Append(JsonEscape(BuildDetailsText(ev))).Append("\"");
                         sb.Append("}");
                     }
                     sb.Append("]");
@@ -845,6 +904,95 @@
             Response.Cache.SetCacheability(HttpCacheability.NoCache);
             Response.Write(sb.ToString());
             Response.End();
+        }
+
+        // Fetches the COMPLETE InstanceData for exactly one event (identified by its unique
+        // Stamp) — only ever called when a user clicks Copy for that specific row, never during
+        // regular polling. This is deliberately separate from the bounded per-row preview in
+        // QueryEvents: the preview keeps every poll cheap, this keeps Copy's result complete.
+        private void WritePayloadJson()
+        {
+            string dbName = Request.QueryString["db"];
+            string[] configuredNames = Factory.GetDatabaseNames();
+            bool known = false;
+            foreach (string n in configuredNames)
+            {
+                if (string.Equals(n, dbName, StringComparison.OrdinalIgnoreCase)) { known = true; dbName = n; break; }
+            }
+
+            StringBuilder sb = new StringBuilder(4096);
+            sb.Append("{");
+
+            long stampValue;
+            if (!known)
+            {
+                sb.Append("\"error\":\"Unknown database.\"");
+            }
+            else if (!long.TryParse(Request.QueryString["stamp"], out stampValue))
+            {
+                sb.Append("\"error\":\"Invalid stamp.\"");
+            }
+            else
+            {
+                string connStr = ResolveConnectionString(dbName);
+                if (string.IsNullOrEmpty(connStr))
+                {
+                    sb.Append("\"error\":\"Could not resolve a connection string for '").Append(JsonEscape(dbName)).Append("'.\"");
+                }
+                else
+                {
+                    try
+                    {
+                        string json = QueryFullPayload(connStr, stampValue);
+                        if (json == null)
+                        {
+                            sb.Append("\"error\":\"No matching event found (it may already have been purged).\"");
+                        }
+                        else
+                        {
+                            sb.Append("\"json\":\"").Append(JsonEscape(json)).Append("\"");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        sb.Append("\"error\":\"").Append(JsonEscape(ex.Message)).Append("\"");
+                    }
+                }
+            }
+
+            sb.Append("}");
+
+            Response.Clear();
+            Response.ContentType = "application/json";
+            Response.Charset = "utf-8";
+            Response.ContentEncoding = System.Text.Encoding.UTF8;
+            Response.Cache.SetCacheability(HttpCacheability.NoCache);
+            Response.Write(sb.ToString());
+            Response.End();
+        }
+
+        // Returns the full decoded InstanceData text for the row with this exact Stamp, or null
+        // if no row matches (e.g. it was purged between the poll that showed it and the click).
+        private string QueryFullPayload(string connectionString, long stamp)
+        {
+            byte[] stampBytes = Int64ToRowVersionBytes(stamp);
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                using (SqlCommand cmd = new SqlCommand("SELECT TOP 1 InstanceData FROM [EventQueue] WHERE Stamp = @stamp", conn))
+                {
+                    cmd.CommandTimeout = 15;
+                    cmd.Parameters.Add("@stamp", SqlDbType.Binary, 8).Value = stampBytes;
+                    using (SqlDataReader reader = cmd.ExecuteReader())
+                    {
+                        if (reader.Read())
+                        {
+                            return ReadJsonTextValue(reader["InstanceData"]);
+                        }
+                    }
+                }
+            }
+            return null;
         }
 
         // Minimal JSON string escaping — same approach as CacheAdmin.aspx: escapes everything
@@ -1008,9 +1156,10 @@
         {
             StringBuilder sb = new StringBuilder();
             sb.Append("<div class='events-head'>EventQueue (top " + events.Count + " by Stamp, newest first) &mdash; " +
-                "metadata only; the InstanceData payload is not decoded. ");
+                "Details shows a decoded summary for recognized event types, or the start of the raw JSON otherwise " +
+                "(only the first " + EventPreviewBytes + " bytes are fetched per row; Copy always fetches the complete value). ");
             sb.Append("<b>&#9654;</b> marks the event this machine's own EQSTAMP currently points to, when it's within this visible window.</div>");
-            sb.Append("<table id='events-table'><thead><tr><th>Stamp</th><th>Created</th><th>EventType</th><th>Details</th><th>Payload</th></tr></thead>");
+            sb.Append("<table id='events-table'><thead><tr><th>Stamp</th><th>Created</th><th>EventType</th><th>Details</th><th>Payload</th><th>Copy</th></tr></thead>");
             sb.Append("<tbody id='events-tbody'>");
             sb.Append(RenderEventRows(events, myStamp));
             sb.Append("</tbody></table>");
@@ -1072,11 +1221,10 @@
                     ev.Stamp.ToString("#,0") + (isMine ? "</b>" : "") + "</td>");
                 sb.Append("<td>" + ev.Created.ToString("HH:mm:ss") + "</td>");
                 sb.Append("<td class='" + EventTypeCssClass(ev.EventType) + "'>" + HttpUtility.HtmlEncode(ShortTypeName(ev.EventType)) + "</td>");
-                // Details: blank for now (EventQueue.InstanceType turned out to just repeat
-                // EventType, so it was dropped entirely) - reserved for future per-event-type
-                // enrichment (e.g. the affected item), left empty until something specific fills it.
-                sb.Append("<td class='details-cell'></td>");
+                sb.Append("<td class='details-cell'>" + HttpUtility.HtmlEncode(BuildDetailsText(ev)) + "</td>");
                 sb.Append("<td class='AlignRight'>" + FormatBytes(ev.PayloadBytes) + "</td>");
+                sb.Append("<td><button type='button' class='copy-btn' data-stamp='" + ev.Stamp +
+                    "' onclick='copyEventPayload(this)'>Copy</button></td>");
                 sb.Append("</tr>");
             }
             return sb.ToString();
@@ -1105,6 +1253,85 @@
             if (bytes < 1024) return bytes + " B";
             if (bytes < 1048576) return ((double)bytes / 1024.0).ToString("#,0.#") + " KB";
             return ((double)bytes / 1048576.0).ToString("#,0.#") + " MB";
+        }
+
+        // ===================== Details column: known-type extraction =====================
+        // InstanceData is JSON text, not a binary payload — safe to read directly, no
+        // deserialization risk. For recognized event types we pull out a couple of interesting
+        // fields with a targeted regex (deliberately not a general-purpose JSON parser: we only
+        // ever need a handful of named, flat fields for a small, curated list of known types).
+        //
+        // IMPORTANT — the field names tried below (ItemId/Id, Language/LanguageName,
+        // Version/VersionNumber) are a best guess, not verified against a live instance. If
+        // "item saved" events aren't showing a summary, copy one via the Copy button, look at the
+        // actual field names in the pasted JSON, and adjust the candidate lists here.
+
+        // Tries each candidate field name in turn (quoted-string value, then bare numeric value)
+        // and returns the first match found anywhere in `json` — a plain substring/regex search,
+        // not real JSON parsing, so a field name that also appears nested elsewhere could produce
+        // a false match. Acceptable for a best-effort preview; not meant to be exhaustive.
+        private string ExtractJsonField(string json, params string[] candidateNames)
+        {
+            foreach (string name in candidateNames)
+            {
+                string pattern = "\"" + Regex.Escape(name) + "\"\\s*:\\s*\"([^\"]*)\"";
+                Match m = Regex.Match(json, pattern, RegexOptions.IgnoreCase);
+                if (m.Success) return m.Groups[1].Value;
+
+                pattern = "\"" + Regex.Escape(name) + "\"\\s*:\\s*([0-9]+)";
+                m = Regex.Match(json, pattern, RegexOptions.IgnoreCase);
+                if (m.Success) return m.Groups[1].Value;
+            }
+            return null;
+        }
+
+        // Returns a short human summary for a recognized event type, or null if the type isn't
+        // recognized (yet) or none of the candidate fields were found in the preview text.
+        private string TryExtractKnownDetails(string eventType, string previewJson)
+        {
+            if (string.IsNullOrEmpty(previewJson)) return null;
+
+            string shortType = ShortTypeName(eventType);
+
+            if (shortType.IndexOf("SavedItemRemoteEvent", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                string itemId = ExtractJsonField(previewJson, "ItemId", "Id");
+                string language = ExtractJsonField(previewJson, "Language", "LanguageName");
+                string version = ExtractJsonField(previewJson, "Version", "VersionNumber");
+
+                if (itemId == null && language == null && version == null) return null;
+
+                StringBuilder sb = new StringBuilder("item saved");
+                if (itemId != null) sb.Append(": ").Append(itemId);
+                if (language != null || version != null)
+                {
+                    sb.Append(" (").Append(language ?? "?");
+                    if (version != null) sb.Append(" v").Append(version);
+                    sb.Append(")");
+                }
+                return sb.ToString();
+            }
+
+            return null; // not a recognized type yet
+        }
+
+        // The Details column's actual content: a known-type summary when we have one, otherwise
+        // the start of the raw JSON preview text, with "..." whenever what's shown is definitely
+        // not the complete value (either the preview itself was truncated by EventPreviewBytes,
+        // or we're additionally trimming it further just for display width).
+        private string BuildDetailsText(EventRow ev)
+        {
+            string known = TryExtractKnownDetails(ev.EventType, ev.PreviewJson);
+            if (known != null) return known;
+
+            if (string.IsNullOrEmpty(ev.PreviewJson)) return string.Empty;
+
+            const int previewChars = 80;
+            bool previewIncomplete = ev.PayloadBytes > EventPreviewBytes;
+            bool displayTruncated = ev.PreviewJson.Length > previewChars;
+            string text = displayTruncated ? ev.PreviewJson.Substring(0, previewChars) : ev.PreviewJson;
+
+            return text + ((previewIncomplete || displayTruncated) ? "..." : "");
         }
     </script>
 </head>
@@ -1309,11 +1536,20 @@
 
                     tr.appendChild(td(ev.ts, ""));
                     tr.appendChild(td(shortType(ev.ty), eventTypeClass(ev.ty)));
-                    // Details: blank for now (EventType/InstanceType turned out to be near-
-                    // duplicates, so InstanceType was dropped entirely) - reserved for future
-                    // per-event-type enrichment.
-                    tr.appendChild(td("", "details-cell"));
+                    // dt is fully computed server-side (BuildDetailsText) - the known-type
+                    // extraction regex isn't duplicated here, so this stays a single source of truth.
+                    tr.appendChild(td(ev.dt || "", "details-cell"));
                     tr.appendChild(td(formatBytes(ev.pb), "AlignRight"));
+
+                    var copyTd = document.createElement("td");
+                    var copyBtn = document.createElement("button");
+                    copyBtn.type = "button";
+                    copyBtn.className = "copy-btn";
+                    copyBtn.textContent = "Copy";
+                    copyBtn.setAttribute("data-stamp", ev.stamp);
+                    copyBtn.onclick = function () { window.copyEventPayload(this); };
+                    copyTd.appendChild(copyBtn);
+                    tr.appendChild(copyTd);
 
                     if (isNew) { tr.classList.add("flash-new"); newRows.push(tr); }
                     tbody.appendChild(tr);
@@ -1453,6 +1689,41 @@
                     poll();
                     startTimer();
                 }
+            };
+
+            // Fetches the COMPLETE raw JSON for one event, on demand, and copies it to the
+            // clipboard - never during regular polling (see WritePayloadJson server-side).
+            window.copyEventPayload = function (btn) {
+                var dbEl = q("hidden-db");
+                if (!dbEl) { return; }
+                var stamp = btn.getAttribute("data-stamp");
+                var original = btn.textContent;
+                btn.disabled = true;
+                btn.textContent = "...";
+
+                fetch("?ajax=payload&db=" + encodeURIComponent(dbEl.value) + "&stamp=" + encodeURIComponent(stamp),
+                      { cache: "no-store" })
+                    .then(function (r) {
+                        if (!r.ok) { throw new Error("HTTP " + r.status); }
+                        return r.json();
+                    })
+                    .then(function (data) {
+                        if (data.error) { throw new Error(data.error); }
+                        if (!navigator.clipboard || !navigator.clipboard.writeText) {
+                            throw new Error("Clipboard API not available in this browser");
+                        }
+                        return navigator.clipboard.writeText(data.json || "");
+                    })
+                    .then(function () {
+                        btn.textContent = "Copied!";
+                    })
+                    .catch(function (e) {
+                        btn.textContent = "Failed";
+                        setStatus("Copy failed: " + e.message);
+                    })
+                    .then(function () {
+                        setTimeout(function () { btn.textContent = original; btn.disabled = false; }, 1500);
+                    });
             };
 
             document.addEventListener("DOMContentLoaded", function () {
