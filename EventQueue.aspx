@@ -199,6 +199,11 @@
             public string RawValue;
             public long? StampValue;
             public bool IsCurrentMachine;
+
+            // Filled in by EnrichEqStamps (a real DB query, not bounded by the visible top-N
+            // window). Null when StampValue itself is null, or the enrichment query failed.
+            public long? UnprocessedCount;    // exact COUNT(*) of EventQueue rows with Stamp > this
+            public double? NearestAgeSeconds; // age of the nearest surviving row at-or-before this stamp
         }
 
         // Overview of the whole EventQueue table, independent of the top-N window shown above.
@@ -215,25 +220,97 @@
         private static readonly HashSet<string> DefaultExcludedFromAutoSelect =
             new HashSet<string>(new[] { "core", "master" }, StringComparer.OrdinalIgnoreCase);
 
-        // How far behind the current head stamp an instance must be before its EQSTAMP row is
-        // considered stale enough to offer deletion. Kept in sync with the client-side
-        // STALE_THRESHOLD constant in the poll script — if you change one, change both.
-        private const int EqStampStaleThreshold = 100;
+        // Age threshold before an EQSTAMP row is considered stale enough to offer deletion. Kept
+        // in sync with the client-side ONE_DAY_SECONDS constant in the poll script.
+        private const double EqStampStaleAgeSeconds = 24 * 60 * 60;
 
         // Delete is only offered for rows that look safely stale:
-        //  - never for the current machine's own row (the one clear self-inflicted mistake),
-        //  - always for a row whose Value isn't even a valid stamp (clearly garbage/legacy),
-        //  - otherwise only once it's more than EqStampStaleThreshold behind the current head,
-        //  - and — since the "show all Properties rows" debug toggle can list totally unrelated
-        //    Sitecore properties — only for keys that actually look like an EQSTAMP entry, so an
-        //    unrelated property never grows a tempting Delete button just because it's not numeric.
-        private bool CanOfferDelete(EqStampRow row, long headStamp, bool haveHeadStamp)
+        //  - never for the current machine's own row (the one clear self-inflicted mistake);
+        //  - never for a key that doesn't actually look like an EQSTAMP entry — since "show all
+        //    Properties rows" can list totally unrelated Sitecore properties, an unrelated
+        //    property must never grow a tempting Delete button just because it's not numeric;
+        //  - always for a row whose Value isn't even a valid stamp (clearly garbage/legacy);
+        //  - (b) otherwise once its stamp is older than the single oldest surviving row in
+        //    EventQueue — this will be the COMMON case, since Properties.Value carries no
+        //    timestamp of its own: once the position has been cleaned up, this is the only
+        //    signal left that it's stale;
+        //  - (a) or, less commonly, when the position technically still exists in the table but
+        //    the nearest surviving event at-or-before it is itself over a day old (EnrichEqStamps
+        //    computes this via a real lookup — it's only available when (b) doesn't already apply).
+        private bool CanOfferDelete(EqStampRow row, QueueStats stats)
         {
             if (row.IsCurrentMachine) return false;
             if (row.Key.IndexOf("EQStamp", StringComparison.OrdinalIgnoreCase) < 0) return false;
             if (!row.StampValue.HasValue) return true;
-            if (!haveHeadStamp) return false;
-            return (headStamp - row.StampValue.Value) > EqStampStaleThreshold;
+
+            if (stats != null && stats.HasAny && row.StampValue.Value < stats.OldestStamp) return true;
+
+            return row.NearestAgeSeconds.HasValue && row.NearestAgeSeconds.Value > EqStampStaleAgeSeconds;
+        }
+
+        // Converts a stamp (as read back from a rowversion column) into the big-endian byte[]
+        // SQL Server expects for comparing against a rowversion column - the inverse of
+        // RowVersionToInt64.
+        private byte[] Int64ToRowVersionBytes(long value)
+        {
+            byte[] bytes = BitConverter.GetBytes(value);
+            if (BitConverter.IsLittleEndian) Array.Reverse(bytes);
+            return bytes;
+        }
+
+        // For each EQSTAMP row with a parseable stamp, runs one real query (not bounded by
+        // whatever top-N window happens to be loaded) to find exactly how many EventQueue rows
+        // are still ahead of it, and the age of the nearest surviving row at-or-before it. Skips
+        // anything that doesn't look like an EQSTAMP key at all (relevant in "show all Properties
+        // rows" debug mode) so it never wastes a query on an unrelated, incidentally-numeric value.
+        // A failure on one row doesn't abort the rest - it just leaves that row's fields null,
+        // which renders as "n/a" and never triggers CanOfferDelete's age-based condition.
+        private void EnrichEqStamps(List<EqStampRow> eqStamps, DbCandidate db)
+        {
+            using (SqlConnection conn = new SqlConnection(db.ConnectionString))
+            {
+                conn.Open();
+
+                foreach (EqStampRow row in eqStamps)
+                {
+                    if (!row.StampValue.HasValue) continue;
+                    if (row.Key.IndexOf("EQStamp", StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                    try
+                    {
+                        byte[] stampBytes = Int64ToRowVersionBytes(row.StampValue.Value);
+
+                        using (SqlCommand cmd = new SqlCommand(
+                            "SELECT COUNT(*) FROM [EventQueue] WHERE Stamp > @stamp; " +
+                            "SELECT TOP 1 Created FROM [EventQueue] WHERE Stamp <= @stamp ORDER BY Stamp DESC;", conn))
+                        {
+                            cmd.CommandTimeout = 15;
+                            cmd.Parameters.Add("@stamp", SqlDbType.Binary, 8).Value = stampBytes;
+
+                            using (SqlDataReader reader = cmd.ExecuteReader())
+                            {
+                                if (reader.Read())
+                                {
+                                    row.UnprocessedCount = Convert.ToInt64(reader[0]);
+                                }
+                                if (reader.NextResult() && reader.Read())
+                                {
+                                    DateTime nearest = reader["Created"] is DateTime ? (DateTime)reader["Created"] : DateTime.MinValue;
+                                    if (nearest != DateTime.MinValue)
+                                    {
+                                        row.NearestAgeSeconds = (DateTime.Now - nearest).TotalSeconds;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Leave this row's fields null; rendering and CanOfferDelete both treat
+                        // that as "unknown" rather than failing the whole page/poll over it.
+                    }
+                }
+            }
         }
 
         protected void Page_Load(object sender, EventArgs e)
@@ -284,7 +361,7 @@
                 }
             }
 
-            string pageVersion = "1.3.0 (localhost-only, read-only SQL diagnostics + guarded EQSTAMP cleanup)";
+            string pageVersion = "1.4.0 (localhost-only, read-only SQL diagnostics + guarded EQSTAMP cleanup)";
             Header.InnerHtml = string.Format("<h2>{0}</h2><h6>Version:&nbsp;{1}</h6>",
                 "Sitecore EventQueue Monitor", pageVersion);
 
@@ -337,10 +414,20 @@
                     HttpUtility.HtmlEncode(selected.Name), HttpUtility.HtmlEncode(ex.Message));
             }
 
+            try
+            {
+                EnrichEqStamps(eqStamps, selected);
+            }
+            catch (Exception ex)
+            {
+                Status.InnerHtml += string.Format("<div class='status error'>EQSTAMP enrichment query failed against [{0}]: {1}</div>",
+                    HttpUtility.HtmlEncode(selected.Name), HttpUtility.HtmlEncode(ex.Message));
+            }
+
             long? myStamp = GetMyStamp(eqStamps);
 
             Controls.InnerHtml = RenderControls(top, selected.Name);
-            EqStampPanel.InnerHtml = RenderEqStampTable(eqStamps, events, selected.Name);
+            EqStampPanel.InnerHtml = RenderEqStampTable(eqStamps, stats, selected.Name);
             EventsPanel.InnerHtml = RenderEventsTable(events, myStamp, stats);
         }
 
@@ -762,8 +849,18 @@
                         statsError = statsEx.Message;
                     }
 
+                    // Also independent, own error field, same reasoning as stats above.
+                    string enrichError = null;
+                    try
+                    {
+                        EnrichEqStamps(eqStamps, cand);
+                    }
+                    catch (Exception enrichEx)
+                    {
+                        enrichError = enrichEx.Message;
+                    }
+
                     long headStamp = events.Count > 0 ? events[0].Stamp : 0;
-                    long oldestVisible = events.Count > 0 ? events[events.Count - 1].Stamp : 0;
                     long? myStamp = GetMyStamp(eqStamps);
 
                     sb.Append("\"db\":\"").Append(JsonEscape(dbName)).Append("\"");
@@ -776,6 +873,10 @@
                     if (statsError != null)
                     {
                         sb.Append(",\"statsError\":\"").Append(JsonEscape(statsError)).Append("\"");
+                    }
+                    if (enrichError != null)
+                    {
+                        sb.Append(",\"enrichError\":\"").Append(JsonEscape(enrichError)).Append("\"");
                     }
                     if (stats != null && stats.HasAny)
                     {
@@ -812,20 +913,14 @@
                     {
                         if (i > 0) sb.Append(',');
                         EqStampRow row = eqStamps[i];
-                        long newer = 0;
-                        if (row.StampValue.HasValue)
-                        {
-                            foreach (EventRow ev in events)
-                                if (ev.Stamp > row.StampValue.Value) newer++;
-                        }
-                        bool offscreen = row.StampValue.HasValue && events.Count > 0 && row.StampValue.Value < oldestVisible;
 
                         sb.Append("{\"key\":\"").Append(JsonEscape(row.Key)).Append("\"");
                         sb.Append(",\"val\":\"").Append(JsonEscape(row.RawValue)).Append("\"");
                         sb.Append(",\"stamp\":").Append(row.StampValue.HasValue ? row.StampValue.Value.ToString() : "null");
                         sb.Append(",\"mine\":").Append(row.IsCurrentMachine ? "true" : "false");
-                        sb.Append(",\"newer\":").Append(newer);
-                        sb.Append(",\"offscreen\":").Append(offscreen ? "true" : "false");
+                        sb.Append(",\"unprocessed\":").Append(row.UnprocessedCount.HasValue ? row.UnprocessedCount.Value.ToString() : "null");
+                        sb.Append(",\"nearestAgeSeconds\":").Append(row.NearestAgeSeconds.HasValue
+                            ? row.NearestAgeSeconds.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "null");
                         sb.Append("}");
                     }
                     sb.Append("]");
@@ -918,39 +1013,28 @@
             return sb.ToString();
         }
 
-        private string RenderEqStampTable(List<EqStampRow> rows, List<EventRow> events, string dbName)
+        private string RenderEqStampTable(List<EqStampRow> rows, QueueStats stats, string dbName)
         {
             StringBuilder sb = new StringBuilder();
             sb.Append("<div class='eqstamp-head'>EQSTAMP rows (Properties table, key LIKE '%EQStamp%') &mdash; ");
             sb.Append("raw keys shown verbatim so duplicate/mistyped keys across machines are visible. ");
-            sb.Append("<b>&#9654;</b> marks this machine's own row. Delete only appears once a row is more than ");
-            sb.Append(EqStampStaleThreshold.ToString("#,0"));
-            sb.Append(" behind the current head stamp (or its value isn't a valid stamp at all).</div>");
+            sb.Append("<b>&#9654;</b> marks this machine's own row. Delete only appears once a row's position ");
+            sb.Append("is older than the oldest surviving event in the queue, or the nearest surviving event at ");
+            sb.Append("or before it is more than a day old (or its value isn't a valid stamp at all).</div>");
             sb.Append("<table id='eqstamp-table'><thead><tr>");
-            sb.Append("<th>Key</th><th>Stamp</th><th>Newer events (visible window)</th><th>Actions</th>");
+            sb.Append("<th>Key</th><th>Stamp</th><th>Unprocessed events</th><th>Actions</th>");
             sb.Append("</tr></thead><tbody id='eqstamp-tbody'>");
-            sb.Append(RenderEqStampRows(rows, events));
+            sb.Append(RenderEqStampRows(rows, stats));
             sb.Append("</tbody></table>");
             return sb.ToString();
         }
 
-        private string RenderEqStampRows(List<EqStampRow> rows, List<EventRow> events)
+        private string RenderEqStampRows(List<EqStampRow> rows, QueueStats stats)
         {
             StringBuilder sb = new StringBuilder();
-            long oldestVisible = events.Count > 0 ? events[events.Count - 1].Stamp : 0;
-            long headStamp = events.Count > 0 ? events[0].Stamp : 0;
-            bool haveHeadStamp = events.Count > 0;
 
             foreach (EqStampRow row in rows)
             {
-                long newer = 0;
-                if (row.StampValue.HasValue)
-                {
-                    foreach (EventRow ev in events)
-                        if (ev.Stamp > row.StampValue.Value) newer++;
-                }
-                bool offscreen = row.StampValue.HasValue && events.Count > 0 && row.StampValue.Value < oldestVisible;
-
                 sb.Append("<tr class='" + (row.IsCurrentMachine ? "eq-mine" : "") + "' data-key=\"" +
                     HttpUtility.HtmlAttributeEncode(row.Key) + "\">");
 
@@ -968,16 +1052,20 @@
                     sb.Append("<td>&quot;" + HttpUtility.HtmlEncode(row.RawValue) + "&quot;</td>");
                 }
 
-                sb.Append("<td class='AlignRight'>" + (row.StampValue.HasValue
-                    ? (offscreen ? "&gt;=" + newer + " (older than visible window)" : newer.ToString())
-                    : "n/a") + "</td>");
+                // Unprocessed events: an exact count from the database, not bounded by whatever
+                // top-N window happens to be loaded (see EnrichEqStamps).
+                string unprocessedText = (row.StampValue.HasValue && row.UnprocessedCount.HasValue)
+                    ? row.UnprocessedCount.Value.ToString("#,0")
+                    : "n/a";
+                sb.Append("<td class='AlignRight'>" + unprocessedText + "</td>");
 
                 sb.Append("<td>");
-                if (CanOfferDelete(row, headStamp, haveHeadStamp))
+                if (CanOfferDelete(row, stats))
                 {
                     sb.Append("<button type='submit' name='deleteKey' value=\"" + HttpUtility.HtmlAttributeEncode(row.Key) + "\" " +
-                        "onclick=\"return confirm('This row looks stale (more than " + EqStampStaleThreshold + " behind, or not a valid " +
-                        "stamp). Delete it? Double-check the instance is really retired first " +
+                        "onclick=\"return confirm('This row looks stale (older than the oldest surviving event in the " +
+                        "queue, or its nearest surviving event is more than a day old, or its value is not a valid " +
+                        "stamp at all). Delete it? Double-check the instance is really retired first " +
                         "\\u2014 if it comes back, deleting its bookmark can make it reprocess or skip a backlog.');\">Delete</button>");
                 }
                 else if (row.IsCurrentMachine)
@@ -1232,17 +1320,23 @@
             }
 
             // Mirrors CanOfferDelete in the server-rendered path (EventQueue.aspx C#) — keep the
-            // two in sync. STALE_THRESHOLD must match EqStampStaleThreshold server-side.
-            var STALE_THRESHOLD = 100;
+            // two in sync. ONE_DAY_SECONDS must match EqStampStaleAgeSeconds server-side.
+            var ONE_DAY_SECONDS = 24 * 60 * 60;
 
-            function canOfferDelete(r, headStamp, haveHead) {
+            function canOfferDelete(r, oldestStamp) {
                 if (r.mine) { return false; }
                 // "Show all Properties rows" can list totally unrelated Sitecore properties —
                 // never offer Delete for a key that doesn't actually look like an EQSTAMP entry.
                 if (r.key.toLowerCase().indexOf("eqstamp") === -1) { return false; }
                 if (r.stamp === null) { return true; }
-                if (!haveHead) { return false; }
-                return (headStamp - r.stamp) > STALE_THRESHOLD;
+
+                // (b) Already-purged position - the common case, since Properties.Value carries no
+                // timestamp of its own to check directly.
+                if (oldestStamp !== null && oldestStamp !== undefined && r.stamp < oldestStamp) { return true; }
+
+                // (a) Still structurally in range, but the nearest surviving event at or before
+                // this position is itself over a day old.
+                return r.nearestAgeSeconds !== null && r.nearestAgeSeconds !== undefined && r.nearestAgeSeconds > ONE_DAY_SECONDS;
             }
 
             // Pointer glyph for "this machine" — built from a decimal code point (pure-ASCII
@@ -1305,7 +1399,7 @@
                 }
             }
 
-            function renderEqStamps(rows, headStamp, haveHead) {
+            function renderEqStamps(rows, oldestStamp) {
                 var tbody = q("eqstamp-tbody");
                 if (!tbody) { return; }
                 tbody.innerHTML = "";
@@ -1334,20 +1428,23 @@
                         tr.appendChild(td(formatNumber(r.stamp), "AlignRight"));
                     }
 
-                    tr.appendChild(td(
-                        r.stamp === null ? "n/a" : (r.offscreen ? (">=" + r.newer + " (older than visible window)") : String(r.newer)),
-                        "AlignRight"));
+                    // Unprocessed events: an exact count from the database (see EnrichEqStamps
+                    // server-side), not bounded by whatever top-N window happens to be loaded.
+                    var unprocessedText = (r.stamp !== null && r.unprocessed !== null && r.unprocessed !== undefined)
+                        ? formatNumber(r.unprocessed) : "n/a";
+                    tr.appendChild(td(unprocessedText, "AlignRight"));
 
                     var actionTd = document.createElement("td");
-                    if (canOfferDelete(r, headStamp, haveHead)) {
+                    if (canOfferDelete(r, oldestStamp)) {
                         var btn = document.createElement("button");
                         btn.type = "submit";
                         btn.name = "deleteKey";
                         btn.value = r.key;
                         btn.textContent = "Delete";
                         btn.onclick = function () {
-                            return confirm("This row looks stale (more than " + STALE_THRESHOLD + " behind, or not a valid stamp). " +
-                                "Delete it? Double-check the instance is really retired first " +
+                            return confirm("This row looks stale (older than the oldest surviving event in the queue, " +
+                                "or its nearest surviving event is more than a day old, or its value is not a valid " +
+                                "stamp at all). Delete it? Double-check the instance is really retired first " +
                                 "- if it comes back, deleting its bookmark can make it reprocess or skip a backlog.");
                         };
                         actionTd.appendChild(btn);
@@ -1388,10 +1485,11 @@
                             setStatus("Error: " + data.error);
                         } else {
                             renderEvents(data.events || [], data.myStamp);
-                            renderEqStamps(data.eqstamps || [], data.headStamp, (data.events || []).length > 0);
+                            renderEqStamps(data.eqstamps || [], data.oldestStamp);
                             renderQueueFooter(data);
                             var statusMsg = "polls: " + pollCount + ", head stamp: " + formatNumber(data.headStamp) + ", db: " + data.db;
                             if (data.statsError) { statusMsg += " (queue overview error: " + data.statsError + ")"; }
+                            if (data.enrichError) { statusMsg += " (EQSTAMP enrichment error: " + data.enrichError + ")"; }
                             setStatus(statusMsg);
                         }
                     })
