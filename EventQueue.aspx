@@ -196,6 +196,27 @@
         private static readonly HashSet<string> DefaultExcludedFromAutoSelect =
             new HashSet<string>(new[] { "core", "master" }, StringComparer.OrdinalIgnoreCase);
 
+        // How far behind the current head stamp an instance must be before its EQSTAMP row is
+        // considered stale enough to offer deletion. Kept in sync with the client-side
+        // STALE_THRESHOLD constant in the poll script — if you change one, change both.
+        private const int EqStampStaleThreshold = 100;
+
+        // Delete is only offered for rows that look safely stale:
+        //  - never for the current machine's own row (the one clear self-inflicted mistake),
+        //  - always for a row whose Value isn't even a valid stamp (clearly garbage/legacy),
+        //  - otherwise only once it's more than EqStampStaleThreshold behind the current head,
+        //  - and — since the "show all Properties rows" debug toggle can list totally unrelated
+        //    Sitecore properties — only for keys that actually look like an EQSTAMP entry, so an
+        //    unrelated property never grows a tempting Delete button just because it's not numeric.
+        private bool CanOfferDelete(EqStampRow row, long headStamp, bool haveHeadStamp)
+        {
+            if (row.IsCurrentMachine) return false;
+            if (row.Key.IndexOf("EQStamp", StringComparison.OrdinalIgnoreCase) < 0) return false;
+            if (!row.StampValue.HasValue) return true;
+            if (!haveHeadStamp) return false;
+            return (headStamp - row.StampValue.Value) > EqStampStaleThreshold;
+        }
+
         protected void Page_Load(object sender, EventArgs e)
         {
             Response.ContentEncoding = System.Text.Encoding.UTF8;
@@ -244,7 +265,7 @@
                 }
             }
 
-            string pageVersion = "1.0.0 (localhost-only, read-only SQL diagnostics + EQSTAMP cleanup)";
+            string pageVersion = "1.1.0 (localhost-only, read-only SQL diagnostics + guarded EQSTAMP cleanup)";
             Header.InnerHtml = string.Format("<h2>{0}</h2><h6>Version:&nbsp;{1}</h6>",
                 "Sitecore EventQueue Monitor", pageVersion);
 
@@ -768,9 +789,11 @@
             StringBuilder sb = new StringBuilder();
             sb.Append("<div class='eqstamp-head'>EQSTAMP rows (Properties table, key LIKE '%EQStamp%') &mdash; ");
             sb.Append("raw keys shown verbatim so duplicate/mistyped keys across machines are visible. ");
-            sb.Append("<b>&#9654;</b> marks this machine's own row.</div>");
+            sb.Append("<b>&#9654;</b> marks this machine's own row. Delete only appears once a row is more than ");
+            sb.Append(EqStampStaleThreshold.ToString("#,0"));
+            sb.Append(" behind the current head stamp (or its value isn't a valid stamp at all).</div>");
             sb.Append("<table id='eqstamp-table'><thead><tr>");
-            sb.Append("<th>Key</th><th>Raw Value</th><th>Parsed Stamp</th><th>Newer events (visible window)</th><th>Actions</th>");
+            sb.Append("<th>Key</th><th>Stamp</th><th>Newer events (visible window)</th><th>Actions</th>");
             sb.Append("</tr></thead><tbody id='eqstamp-tbody'>");
             sb.Append(RenderEqStampRows(rows, events));
             sb.Append("</tbody></table>");
@@ -781,6 +804,8 @@
         {
             StringBuilder sb = new StringBuilder();
             long oldestVisible = events.Count > 0 ? events[events.Count - 1].Stamp : 0;
+            long headStamp = events.Count > 0 ? events[0].Stamp : 0;
+            bool haveHeadStamp = events.Count > 0;
 
             foreach (EqStampRow row in rows)
             {
@@ -797,22 +822,37 @@
 
                 sb.Append("<td>" + (row.IsCurrentMachine ? "<b>&#9654; " : "") +
                     HttpUtility.HtmlEncode(row.Key) + (row.IsCurrentMachine ? "</b>" : "") + "</td>");
-                sb.Append("<td>" + HttpUtility.HtmlEncode(row.RawValue) + "</td>");
-                sb.Append("<td class='AlignRight'>" + (row.StampValue.HasValue ? row.StampValue.Value.ToString() : "<i>not numeric</i>") + "</td>");
+
+                // Stamp: a formatted number when parseable (values are ~9 digits, hence the
+                // thousands grouping), or the raw text in quotes to flag it wasn't valid.
+                if (row.StampValue.HasValue)
+                {
+                    sb.Append("<td class='AlignRight'>" + row.StampValue.Value.ToString("#,0") + "</td>");
+                }
+                else
+                {
+                    sb.Append("<td>&quot;" + HttpUtility.HtmlEncode(row.RawValue) + "&quot;</td>");
+                }
+
                 sb.Append("<td class='AlignRight'>" + (row.StampValue.HasValue
                     ? (offscreen ? "&gt;=" + newer + " (older than visible window)" : newer.ToString())
                     : "n/a") + "</td>");
 
                 sb.Append("<td>");
-                if (!row.IsCurrentMachine)
+                if (CanOfferDelete(row, headStamp, haveHeadStamp))
                 {
                     sb.Append("<button type='submit' name='deleteKey' value=\"" + HttpUtility.HtmlAttributeEncode(row.Key) + "\" " +
-                        "onclick=\"return confirm('Delete this Properties row? Only do this for STALE/retired instances " +
-                        "\\u2014 deleting an ACTIVE instance\\'s row can make it reprocess or skip a backlog.');\">Delete</button>");
+                        "onclick=\"return confirm('This row looks stale (more than " + EqStampStaleThreshold + " behind, or not a valid " +
+                        "stamp). Delete it? Double-check the instance is really retired first " +
+                        "\\u2014 if it comes back, deleting its bookmark can make it reprocess or skip a backlog.');\">Delete</button>");
+                }
+                else if (row.IsCurrentMachine)
+                {
+                    sb.Append("<i>(this machine)</i>");
                 }
                 else
                 {
-                    sb.Append("<i>(this machine)</i>");
+                    sb.Append("<i>(active)</i>");
                 }
                 sb.Append("</td>");
                 sb.Append("</tr>");
@@ -938,6 +978,35 @@
                 return (n / 1048576).toFixed(1) + " MB";
             }
 
+            // Thousands-grouped integer formatting (stamps are ~9 digits) — hand-rolled rather
+            // than toLocaleString() so the grouping is deterministic regardless of browser locale.
+            function formatNumber(n) {
+                var s = String(n);
+                var neg = s.charAt(0) === "-";
+                if (neg) { s = s.substring(1); }
+                var parts = [];
+                while (s.length > 3) {
+                    parts.unshift(s.slice(-3));
+                    s = s.slice(0, -3);
+                }
+                parts.unshift(s);
+                return (neg ? "-" : "") + parts.join(",");
+            }
+
+            // Mirrors CanOfferDelete in the server-rendered path (EventQueue.aspx C#) — keep the
+            // two in sync. STALE_THRESHOLD must match EqStampStaleThreshold server-side.
+            var STALE_THRESHOLD = 100;
+
+            function canOfferDelete(r, headStamp, haveHead) {
+                if (r.mine) { return false; }
+                // "Show all Properties rows" can list totally unrelated Sitecore properties —
+                // never offer Delete for a key that doesn't actually look like an EQSTAMP entry.
+                if (r.key.toLowerCase().indexOf("eqstamp") === -1) { return false; }
+                if (r.stamp === null) { return true; }
+                if (!haveHead) { return false; }
+                return (headStamp - r.stamp) > STALE_THRESHOLD;
+            }
+
             // Pointer glyph for "this machine" — built from a decimal code point (pure-ASCII
             // source) so it renders correctly regardless of charset, per this folder's convention.
             var GLYPH_PTR = String.fromCharCode(9654); // U+25B6 black right-pointing triangle
@@ -985,7 +1054,7 @@
                 }
             }
 
-            function renderEqStamps(rows) {
+            function renderEqStamps(rows, headStamp, haveHead) {
                 var tbody = q("eqstamp-tbody");
                 if (!tbody) { return; }
                 tbody.innerHTML = "";
@@ -1006,26 +1075,35 @@
                     }
                     tr.appendChild(keyTd);
 
-                    tr.appendChild(td(r.val, ""));
-                    tr.appendChild(td(r.stamp === null ? "not numeric" : r.stamp, "AlignRight"));
+                    // Stamp: formatted number when parseable, or the raw text in quotes to flag
+                    // it wasn't valid — merges what used to be two separate columns.
+                    if (r.stamp === null) {
+                        tr.appendChild(td("\"" + r.val + "\"", ""));
+                    } else {
+                        tr.appendChild(td(formatNumber(r.stamp), "AlignRight"));
+                    }
+
                     tr.appendChild(td(
                         r.stamp === null ? "n/a" : (r.offscreen ? (">=" + r.newer + " (older than visible window)") : String(r.newer)),
                         "AlignRight"));
 
                     var actionTd = document.createElement("td");
-                    if (r.mine) {
-                        actionTd.textContent = "(this machine)";
-                    } else {
+                    if (canOfferDelete(r, headStamp, haveHead)) {
                         var btn = document.createElement("button");
                         btn.type = "submit";
                         btn.name = "deleteKey";
                         btn.value = r.key;
                         btn.textContent = "Delete";
                         btn.onclick = function () {
-                            return confirm("Delete this Properties row? Only do this for STALE/retired instances " +
-                                "- deleting an ACTIVE instance's row can make it reprocess or skip a backlog.");
+                            return confirm("This row looks stale (more than " + STALE_THRESHOLD + " behind, or not a valid stamp). " +
+                                "Delete it? Double-check the instance is really retired first " +
+                                "- if it comes back, deleting its bookmark can make it reprocess or skip a backlog.");
                         };
                         actionTd.appendChild(btn);
+                    } else if (r.mine) {
+                        actionTd.textContent = "(this machine)";
+                    } else {
+                        actionTd.textContent = "(active)";
                     }
                     tr.appendChild(actionTd);
 
@@ -1059,8 +1137,8 @@
                             setStatus("Error: " + data.error);
                         } else {
                             renderEvents(data.events || []);
-                            renderEqStamps(data.eqstamps || []);
-                            setStatus("polls: " + pollCount + ", head stamp: " + data.headStamp + ", db: " + data.db);
+                            renderEqStamps(data.eqstamps || [], data.headStamp, (data.events || []).length > 0);
+                            setStatus("polls: " + pollCount + ", head stamp: " + formatNumber(data.headStamp) + ", db: " + data.db);
                         }
                     })
                     .catch(function (e) {

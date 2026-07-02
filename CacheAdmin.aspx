@@ -365,7 +365,8 @@
 
         // Kinds hidden on first load (user's "never used"). Client localStorage overrides after that.
         private static readonly HashSet<string> DefaultHiddenKinds =
-            new HashSet<string>(new[] { "xsl", "viewstate", "registry" }, StringComparer.OrdinalIgnoreCase);
+            new HashSet<string>(new[] { "xsl", "viewstate", "registry", "languageFallbackObsolete", "isLanguageFallbackValidObsolete" }, 
+                StringComparer.OrdinalIgnoreCase);
 
         public const string GroupContentSite = "Content site";
         public const string GroupSystemSite = "System site";
@@ -531,7 +532,7 @@
             }
 
             // Render Header
-            string pageVersion = "4.0.0 (localhost-only admin, clear + live tracking + group/kind filtering)";
+            string pageVersion = "4.0.1 (localhost-only admin, clear + live tracking + group/kind filtering)";
             string pageName = "Sitecore Cache Admin";
             Header.InnerHtml = string.Format("<h2>{0}</h2><h6>Version:&nbsp;{1}</h6>", pageName, pageVersion);
 
@@ -934,7 +935,7 @@
                 data.Add(maxSizeEntry);
 
                 long utilizationLong = GetUtilization(cache.Size, cache.MaxSize);
-                string utilizationString = utilizationLong >= 0 ? utilizationLong.ToString() : "n/a";
+                string utilizationString = utilizationLong >= 0 ? utilizationLong.ToString("#,0") + "%" : "n/a";
                 string utilizationClass = utilizationLong < 80 ? "CacheUtilizationLow" : "CacheUtilizationHigh";
                 CellEntry utilizationEntry = new CellEntry(utilizationString, baseCssClassForData + " " + utilizationClass);
                 data.Add(utilizationEntry);
@@ -947,7 +948,7 @@
                 data.Add(new CellEntry(string.Empty, "AlignCenter trend-cell"));  // Trend (live only)
 
                 long peakUtil = st != null ? st.PeakUtilization : utilizationLong;
-                data.Add(new CellEntry(peakUtil >= 0 ? peakUtil.ToString() : "n/a", baseCssClassForData));
+                data.Add(new CellEntry(peakUtil >= 0 ? peakUtil.ToString() + "%" : "n/a", baseCssClassForData));
 
                 int eventCount = st != null ? st.EventCount : 0;
                 data.Add(new CellEntry(eventCount.ToString(), baseCssClassForData + " events-cell"));
@@ -1567,9 +1568,9 @@
                     { t: c.c, cls: "AlignRight" },
                     { t: c.ss, cls: "AlignRight" },
                     { t: c.mss, cls: "MaxSize AlignRight" },
-                    { t: (c.u < 0 ? "n/a" : c.u), cls: "AlignRight" },
+                    { t: (c.u < 0 ? "n/a" : c.u + "%"), cls: "AlignRight" },
                     { t: "", cls: "AlignCenter trend-cell" },
-                    { t: (c.pu < 0 ? "n/a" : c.pu), cls: "AlignRight" },
+                    { t: (c.pu < 0 ? "n/a" : c.pu + "%"), cls: "AlignRight" },
                     { t: c.ec, cls: "AlignRight events-cell" },
                     { t: (c.le || ""), cls: "lastevent-cell ev-" + (c.le || "none") }
                 ];
@@ -1604,14 +1605,14 @@
                 var tds = tr.children;
                 setText(tds[COL.count], c.c);
                 setText(tds[COL.size], c.ss);
-                setText(tds[COL.util], c.u < 0 ? "n/a" : c.u);
+                setText(tds[COL.util], c.u < 0 ? "n/a" : c.u + "%");
 
                 var trendTd = tds[COL.trend];
                 setText(trendTd, trendSymbol(c.t));
                 trendTd.className = "AlignCenter trend-cell" +
                     (c.t === "up" ? " trend-up" : (c.t === "down" ? " trend-down" : ""));
 
-                setText(tds[COL.peakutil], c.pu < 0 ? "n/a" : c.pu);
+                setText(tds[COL.peakutil], c.pu < 0 ? "n/a" : c.pu + "%");
                 setText(tds[COL.events], c.ec);
 
                 setText(tds[COL.lastevent], c.le || "");
