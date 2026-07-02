@@ -146,6 +146,14 @@
             color: #444;
         }
 
+        .events-footer {
+            padding: 8px 0 0 0;
+            font-size: 12px;
+            color: #555;
+            border-top: 1px dashed #ccc;
+            margin-top: 4px;
+        }
+
         tr.eq-mine td {
             background-color: #fff9c4;
         }
@@ -191,6 +199,17 @@
             public string RawValue;
             public long? StampValue;
             public bool IsCurrentMachine;
+        }
+
+        // Overview of the whole EventQueue table, independent of the top-N window shown above.
+        // Exists specifically to catch Sitecore's cleanup agent purging events too aggressively -
+        // if a CD's EQSTAMP is older than OldestCreated, the events it still needs are already gone.
+        public class QueueStats
+        {
+            public long TotalCount;
+            public bool HasAny;
+            public long OldestStamp;
+            public DateTime OldestCreated;
         }
 
         private static readonly HashSet<string> DefaultExcludedFromAutoSelect =
@@ -265,7 +284,7 @@
                 }
             }
 
-            string pageVersion = "1.2.0 (localhost-only, read-only SQL diagnostics + guarded EQSTAMP cleanup)";
+            string pageVersion = "1.3.0 (localhost-only, read-only SQL diagnostics + guarded EQSTAMP cleanup)";
             Header.InnerHtml = string.Format("<h2>{0}</h2><h6>Version:&nbsp;{1}</h6>",
                 "Sitecore EventQueue Monitor", pageVersion);
 
@@ -306,11 +325,23 @@
                 return;
             }
 
+            QueueStats stats;
+            try
+            {
+                stats = QueryQueueStats(selected);
+            }
+            catch (Exception ex)
+            {
+                stats = null;
+                Status.InnerHtml += string.Format("<div class='status error'>Queue overview query failed against [{0}]: {1}</div>",
+                    HttpUtility.HtmlEncode(selected.Name), HttpUtility.HtmlEncode(ex.Message));
+            }
+
             long? myStamp = GetMyStamp(eqStamps);
 
             Controls.InnerHtml = RenderControls(top, selected.Name);
             EqStampPanel.InnerHtml = RenderEqStampTable(eqStamps, events, selected.Name);
-            EventsPanel.InnerHtml = RenderEventsTable(events, myStamp);
+            EventsPanel.InnerHtml = RenderEventsTable(events, myStamp, stats);
         }
 
         // Finds this machine's own parsed EQSTAMP value (if any), used to draw the pointer into
@@ -526,6 +557,58 @@
             return list;
         }
 
+        // Overview independent of the top-N window: total row count, plus the single oldest row
+        // (by Stamp, which correlates with insertion order). This is what actually answers "is
+        // Sitecore's cleanup agent purging events before every CD has processed them" - compare
+        // OldestCreated/OldestStamp against each CD's EQSTAMP in the table above.
+        private QueueStats QueryQueueStats(DbCandidate db)
+        {
+            QueueStats stats = new QueueStats();
+            using (SqlConnection conn = new SqlConnection(db.ConnectionString))
+            {
+                conn.Open();
+
+                using (SqlCommand cmd = new SqlCommand("SELECT COUNT(*) FROM [EventQueue]", conn))
+                {
+                    // Longer timeout than the other queries here on purpose: if the cleanup agent
+                    // really isn't keeping this table small, that slowness IS part of the finding,
+                    // not something to hide behind a quick timeout.
+                    cmd.CommandTimeout = 30;
+                    object result = cmd.ExecuteScalar();
+                    stats.TotalCount = (result == null || result == DBNull.Value) ? 0 : Convert.ToInt64(result);
+                }
+
+                using (SqlCommand cmd = new SqlCommand("SELECT TOP 1 Created, Stamp FROM [EventQueue] ORDER BY Stamp ASC", conn))
+                {
+                    cmd.CommandTimeout = 15;
+                    using (SqlDataReader reader = cmd.ExecuteReader())
+                    {
+                        if (reader.Read())
+                        {
+                            stats.HasAny = true;
+                            stats.OldestCreated = reader["Created"] is DateTime ? (DateTime)reader["Created"] : DateTime.MinValue;
+                            stats.OldestStamp = ReadStampValue(reader["Stamp"]);
+                        }
+                    }
+                }
+            }
+            return stats;
+        }
+
+        // Renders e.g. "3h 12m ago" from a (server-computed) elapsed-seconds value. Always compute
+        // the elapsed time server-side (DateTime.Now - Created) rather than sending a raw timestamp
+        // for the browser to diff against its own clock - browser/server clock skew would silently
+        // corrupt exactly the kind of timing judgement this page exists to make.
+        private string FormatAge(double totalSeconds)
+        {
+            if (totalSeconds < 0) totalSeconds = 0;
+            TimeSpan span = TimeSpan.FromSeconds(totalSeconds);
+            if (span.TotalDays >= 1) return string.Format("{0}d {1}h ago", (int)span.TotalDays, span.Hours);
+            if (span.TotalHours >= 1) return string.Format("{0}h {1}m ago", (int)span.TotalHours, span.Minutes);
+            if (span.TotalMinutes >= 1) return string.Format("{0}m {1}s ago", (int)span.TotalMinutes, span.Seconds);
+            return string.Format("{0}s ago", (int)span.TotalSeconds);
+        }
+
         // Broad LIKE match rather than an assumed exact prefix — Sitecore's EQSTAMP key format
         // isn't guaranteed identical across versions, and this is more robust than guessing wrong.
         // Raw keys are returned verbatim/unparsed so duplicate or subtly-mistyped keys are visible.
@@ -648,18 +731,35 @@
                     }
                     catch { }
 
+                    DbCandidate cand = new DbCandidate { Name = dbName, ConnectionString = connStr, DataSource = dataSource, InitialCatalog = catalog };
+
                     List<EventRow> events = new List<EventRow>();
                     List<EqStampRow> eqStamps = new List<EqStampRow>();
                     string queryError = null;
                     try
                     {
-                        DbCandidate cand = new DbCandidate { Name = dbName, ConnectionString = connStr, DataSource = dataSource, InitialCatalog = catalog };
                         events = QueryEvents(cand, top);
                         eqStamps = QueryEqStamps(cand, showAll);
                     }
                     catch (Exception ex)
                     {
                         queryError = ex.Message;
+                    }
+
+                    // Queried independently, with its OWN error field: a slow/failing COUNT(*) on
+                    // a much-larger-than-expected table must not blank out the events/eqstamps
+                    // data still being watched live (that shared "error" field aborts all rendering
+                    // client-side — see poll() below — so mixing the two failure modes would hide
+                    // perfectly good data just because the overview query hiccuped).
+                    QueueStats stats = null;
+                    string statsError = null;
+                    try
+                    {
+                        stats = QueryQueueStats(cand);
+                    }
+                    catch (Exception statsEx)
+                    {
+                        statsError = statsEx.Message;
                     }
 
                     long headStamp = events.Count > 0 ? events[0].Stamp : 0;
@@ -671,6 +771,23 @@
                     sb.Append(",\"catalog\":\"").Append(JsonEscape(catalog)).Append("\"");
                     sb.Append(",\"headStamp\":").Append(headStamp);
                     sb.Append(",\"myStamp\":").Append(myStamp.HasValue ? myStamp.Value.ToString() : "null");
+                    sb.Append(",\"shownCount\":").Append(events.Count);
+                    sb.Append(",\"totalInQueue\":").Append(stats != null ? stats.TotalCount.ToString() : "null");
+                    if (statsError != null)
+                    {
+                        sb.Append(",\"statsError\":\"").Append(JsonEscape(statsError)).Append("\"");
+                    }
+                    if (stats != null && stats.HasAny)
+                    {
+                        double ageSeconds = (DateTime.Now - stats.OldestCreated).TotalSeconds;
+                        sb.Append(",\"oldestStamp\":").Append(stats.OldestStamp);
+                        sb.Append(",\"oldestCreated\":\"").Append(JsonEscape(stats.OldestCreated.ToString("yyyy-MM-dd HH:mm:ss"))).Append("\"");
+                        sb.Append(",\"oldestAgeSeconds\":").Append(ageSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    }
+                    else
+                    {
+                        sb.Append(",\"oldestStamp\":null,\"oldestCreated\":null,\"oldestAgeSeconds\":null");
+                    }
                     if (queryError != null)
                     {
                         sb.Append(",\"error\":\"").Append(JsonEscape(queryError)).Append("\"");
@@ -877,7 +994,7 @@
             return sb.ToString();
         }
 
-        private string RenderEventsTable(List<EventRow> events, long? myStamp)
+        private string RenderEventsTable(List<EventRow> events, long? myStamp, QueueStats stats)
         {
             StringBuilder sb = new StringBuilder();
             sb.Append("<div class='events-head'>EventQueue (top " + events.Count + " by Stamp, newest first) &mdash; " +
@@ -887,6 +1004,49 @@
             sb.Append("<tbody id='events-tbody'>");
             sb.Append(RenderEventRows(events, myStamp));
             sb.Append("</tbody></table>");
+            sb.Append(RenderQueueFooter(events.Count, stats));
+            return sb.ToString();
+        }
+
+        // Shown right after the table ("at the end of the queue"): total row count regardless of
+        // the top-N window, and the single oldest row in the whole table. This is the direct check
+        // for "is the cleanup agent purging events before every CD has processed them" - compare
+        // OldestCreated/OldestStamp here against the EQSTAMP table above.
+        private string RenderQueueFooter(int shownCount, QueueStats stats)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("<div id='events-footer' class='events-footer'>");
+
+            if (stats == null)
+            {
+                sb.Append("Queue overview unavailable (see error above).");
+                sb.Append("</div>");
+                return sb.ToString();
+            }
+
+            long more = stats.TotalCount - shownCount;
+            if (more < 0) more = 0;
+
+            sb.Append("Total events in queue: <b>" + stats.TotalCount.ToString("#,0") + "</b>");
+            if (more > 0)
+            {
+                sb.Append(" (<b>" + more.ToString("#,0") + "</b> more not shown above)");
+            }
+            sb.Append(". ");
+
+            if (stats.HasAny)
+            {
+                double ageSeconds = (DateTime.Now - stats.OldestCreated).TotalSeconds;
+                sb.Append("Oldest event in queue: <b>" + stats.OldestCreated.ToString("yyyy-MM-dd HH:mm:ss") + "</b> (" +
+                    FormatAge(ageSeconds) + ", stamp " + stats.OldestStamp.ToString("#,0") + "). ");
+                sb.Append("If a CD's EQSTAMP is older than this, the events it still needs may already have been purged by Sitecore's cleanup agent.");
+            }
+            else
+            {
+                sb.Append("Queue is currently empty.");
+            }
+
+            sb.Append("</div>");
             return sb.ToString();
         }
 
@@ -1012,6 +1172,63 @@
                 }
                 parts.unshift(s);
                 return (neg ? "-" : "") + parts.join(",");
+            }
+
+            // Mirrors FormatAge in the server-rendered path. Takes a server-computed elapsed-
+            // seconds value rather than diffing against the browser's own clock - relying on the
+            // browser's clock here would silently corrupt exactly the kind of timing judgement
+            // this page exists to make.
+            function formatAge(totalSeconds) {
+                if (totalSeconds === null || totalSeconds === undefined) { return ""; }
+                if (totalSeconds < 0) { totalSeconds = 0; }
+                var days = Math.floor(totalSeconds / 86400);
+                var hours = Math.floor((totalSeconds % 86400) / 3600);
+                var minutes = Math.floor((totalSeconds % 3600) / 60);
+                var seconds = Math.floor(totalSeconds % 60);
+                if (days >= 1) { return days + "d " + hours + "h ago"; }
+                if (hours >= 1) { return hours + "h " + minutes + "m ago"; }
+                if (minutes >= 1) { return minutes + "m " + seconds + "s ago"; }
+                return seconds + "s ago";
+            }
+
+            function renderQueueFooter(data) {
+                var el = q("events-footer");
+                if (!el) { return; }
+                el.innerHTML = "";
+
+                if (data.totalInQueue === null || data.totalInQueue === undefined) {
+                    el.textContent = "Queue overview unavailable" + (data.statsError ? (": " + data.statsError) : ".");
+                    return;
+                }
+
+                var more = data.totalInQueue - (data.shownCount || 0);
+                if (more < 0) { more = 0; }
+
+                el.appendChild(document.createTextNode("Total events in queue: "));
+                var totalB = document.createElement("b");
+                totalB.textContent = formatNumber(data.totalInQueue);
+                el.appendChild(totalB);
+
+                if (more > 0) {
+                    el.appendChild(document.createTextNode(" ("));
+                    var moreB = document.createElement("b");
+                    moreB.textContent = formatNumber(more);
+                    el.appendChild(moreB);
+                    el.appendChild(document.createTextNode(" more not shown above)"));
+                }
+                el.appendChild(document.createTextNode(". "));
+
+                if (data.oldestCreated) {
+                    el.appendChild(document.createTextNode("Oldest event in queue: "));
+                    var oldB = document.createElement("b");
+                    oldB.textContent = data.oldestCreated;
+                    el.appendChild(oldB);
+                    el.appendChild(document.createTextNode(" (" + formatAge(data.oldestAgeSeconds) + ", stamp " +
+                        formatNumber(data.oldestStamp) + "). If a CD's EQSTAMP is older than this, the events it still " +
+                        "needs may already have been purged by Sitecore's cleanup agent."));
+                } else {
+                    el.appendChild(document.createTextNode("Queue is currently empty."));
+                }
             }
 
             // Mirrors CanOfferDelete in the server-rendered path (EventQueue.aspx C#) — keep the
@@ -1172,7 +1389,10 @@
                         } else {
                             renderEvents(data.events || [], data.myStamp);
                             renderEqStamps(data.eqstamps || [], data.headStamp, (data.events || []).length > 0);
-                            setStatus("polls: " + pollCount + ", head stamp: " + formatNumber(data.headStamp) + ", db: " + data.db);
+                            renderQueueFooter(data);
+                            var statusMsg = "polls: " + pollCount + ", head stamp: " + formatNumber(data.headStamp) + ", db: " + data.db;
+                            if (data.statsError) { statusMsg += " (queue overview error: " + data.statsError + ")"; }
+                            setStatus(statusMsg);
                         }
                     })
                     .catch(function (e) {
